@@ -7,11 +7,16 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "node src/server.js",
-    "test": "node --test"
+    "test": "node --test",
+    "quick-connect": "node scripts/quick-connect.js"
   },
   "dependencies": {
     "express": "^4.21.2",
     "sqlite3": "^6.0.1",
     "ws": "^8.19.0"
+  },
+  "devDependencies": {
+    "@playwright/mcp": "^0.0.68",
+    "playwright": "^1.59.0-alpha-1771104257000"
   }
 }

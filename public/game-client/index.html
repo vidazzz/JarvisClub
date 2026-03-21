@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>JarvisClub Game Client</title>
+    <link rel="stylesheet" href="/game-client/styles.css" />
+  </head>
+  <body>
+    <main class="layout">
+      <section class="panel">
+        <h1>JarvisClub Game Client</h1>
+        <p class="muted">正式客户端 v0：世界快照、房间会话、AI 引导。</p>
+        <div class="actions">
+          <button id="connectBtn">连接实时会话</button>
+          <button id="enterWorldBtn">进入大厅</button>
+          <button id="joinRoomBtn">加入房间 room_arcade_001</button>
+          <button id="leaveRoomBtn">离开房间</button>
+        </div>
+        <div class="actions">
+          <button id="sendGuidanceBtn">发送高层引导</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>当前状态</h2>
+        <pre id="stateView">尚未连接。</pre>
+      </section>
+
+      <section class="panel">
+        <h2>事件流</h2>
+        <div id="eventsView" class="events"></div>
+      </section>
+    </main>
+
+    <script src="/game-client/app.js" defer></script>
+  </body>
+</html>

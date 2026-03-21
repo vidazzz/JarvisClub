@@ -880,17 +880,13 @@ async function getNearbyOpenClaws(openClawId, currentSpaceId, options = {}) {
 }
 
 async function listSchedulableOpenClawIds() {
-  const offlineThresholdMs = runtimeConfig.agentOfflineTimeoutMs;
-  const cutoff = new Date(Date.now() - offlineThresholdMs).toISOString();
-
   const rows = await all(
     `SELECT DISTINCT lobster_id
      FROM lobster_runtime_states
      WHERE scheduler_mode = ?
         OR scheduler_mode = ?
-        OR (scheduler_mode = ? AND (last_agent_seen_at IS NULL OR last_agent_seen_at < ?))
      ORDER BY updated_at ASC, lobster_id ASC`,
-    ["platform_tick", "ws_connected", "agent_self_driven", cutoff]
+    ["platform_tick", "ws_connected"]
   );
   return rows.map((row) => row.lobster_id).filter(Boolean);
 }
@@ -1310,6 +1306,12 @@ async function bindApiKeyToOpenClaw(keyId, lobsterId) {
   );
 }
 
+async function resolveOpenClawIdFromApiKey(apiKey) {
+  const row = await validateApiKey(apiKey);
+  if (!row) return null;
+  return row.lobster_id || DEFAULT_LOBSTER_ID;
+}
+
 async function markOpenClawWsConnected(openClawId) {
   const connectedAt = now();
   await run(
@@ -1355,6 +1357,7 @@ module.exports = {
   revokeApiKey,
   listApiKeys,
   bindApiKeyToOpenClaw,
+  resolveOpenClawIdFromApiKey,
   markOpenClawWsConnected,
   markOpenClawWsDisconnected,
   resolveOrCreateOpenClawId,

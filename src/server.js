@@ -6,6 +6,12 @@ const { getRuntimeConfig } = require("./config");
 const { createOpenClawAdapter } = require("./openclawAdapter");
 const { OpenClawScheduler } = require("./scheduler");
 const { WsManager } = require("./wsManager");
+const { SessionService } = require("./runtime/sessionService");
+const { RoomService } = require("./runtime/roomService");
+const { ReadModelService } = require("./runtime/readModelService");
+const { WorldService } = require("./runtime/worldService");
+const { AgentOrchestrationService } = require("./runtime/agentOrchestration");
+const { ClientRealtimeGateway } = require("./runtime/clientRealtimeGateway");
 const {
   initializeStore,
   getProfile,
@@ -27,6 +33,7 @@ const {
   listSchedulableOpenClawIds,
   connectService,
   createApiKey,
+  resolveOpenClawIdFromApiKey,
   revokeApiKey,
   listApiKeys,
 } = require("./platformStore");
@@ -37,8 +44,14 @@ const PORT = runtimeConfig.port;
 const HOST = runtimeConfig.host;
 const activeStreams = new Set();
 let wsManager = null;
+let clientRealtimeGateway = null;
 let connectorProcess = null;
 let connectorApiKey = null;
+let sessionService = null;
+let roomService = null;
+let readModelService = null;
+let worldService = null;
+let agentOrchestration = null;
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "..", "public")));
@@ -134,8 +147,8 @@ app.post("/api/me/hosting/start", async (req, res) => {
     const keyData = await createApiKey({ displayLabel: "托管" });
     connectorApiKey = keyData.apiKey;
 
-    // Spawn connector process
-    const connectorPath = path.join(__dirname, "..", "connector", "index.js");
+    // Spawn AI worker process
+    const connectorPath = path.join(__dirname, "..", "ai-worker", "index.js");
     const wsUrl = `ws://127.0.0.1:${PORT}/ws/agent`;
 
     const openclawConfig = detectOpenClawGateway();
@@ -156,14 +169,14 @@ app.post("/api/me/hosting/start", async (req, res) => {
 
     connectorProcess.stdout.on("data", (data) => {
       const line = data.toString().trim();
-      if (line) console.log(`[connector] ${line}`);
+      if (line) console.log(`[ai-worker] ${line}`);
     });
     connectorProcess.stderr.on("data", (data) => {
       const line = data.toString().trim();
-      if (line) console.warn(`[connector] ${line}`);
+      if (line) console.warn(`[ai-worker] ${line}`);
     });
     connectorProcess.on("exit", (code) => {
-      console.log(`[connector] 进程退出, code=${code}`);
+      console.log(`[ai-worker] 进程退出, code=${code}`);
       connectorProcess = null;
     });
 
@@ -207,6 +220,86 @@ app.post("/api/me/hosting/stop", async (req, res) => {
 app.get("/api/me/hosting/status", async (req, res) => {
   try {
     res.json(getHostingStatus());
+  } catch (error) {
+    res.status(500).json({ error: error.message || "Internal server error" });
+  }
+});
+
+app.get("/api/me/world", async (req, res) => {
+  try {
+    const openClawId = await resolveRequestOpenClawId(req);
+    const world = await worldService.getWorldSnapshot(openClawId);
+    res.json(world);
+  } catch (error) {
+    res.status(500).json({ error: error.message || "Internal server error" });
+  }
+});
+
+app.get("/api/me/rooms/:roomId", (req, res) => {
+  try {
+    const room = roomService.getRoomSnapshot(req.params.roomId);
+    if (!room) {
+      res.status(404).json({ error: "Room not found" });
+      return;
+    }
+    res.json(room);
+  } catch (error) {
+    res.status(500).json({ error: error.message || "Internal server error" });
+  }
+});
+
+app.post("/api/me/rooms/:roomId/join", async (req, res) => {
+  const openClawId = await resolveRequestOpenClawId(req);
+  const joined = await joinRoomAndWriteback({
+    roomId: req.params.roomId,
+    openClawId,
+  });
+  if (!joined.ok) {
+    res.status(400).json({ error: joined.error });
+    return;
+  }
+  res.status(201).json(joined.room);
+});
+
+app.post("/api/me/rooms/:roomId/leave", async (req, res) => {
+  const openClawId = await resolveRequestOpenClawId(req);
+  const left = await leaveRoomAndWriteback({
+    roomId: req.params.roomId,
+    openClawId,
+  });
+  if (!left.ok) {
+    res.status(404).json({ error: left.error });
+    return;
+  }
+  res.json(left.room);
+});
+
+app.post("/api/me/guidance", (req, res) => {
+  res.status(202).json({
+    ok: true,
+    acceptedAt: new Date().toISOString(),
+    guidance: req.body || {},
+    mode: "high_level_guidance",
+  });
+});
+
+app.get("/api/me/events", async (req, res) => {
+  try {
+    const openClawId = await resolveRequestOpenClawId(req);
+    const events = await readModelService.getEventsView(openClawId, {
+      limit: req.query.limit || 12,
+      type: req.query.type || null,
+    });
+    res.json(events);
+  } catch (error) {
+    res.status(500).json({ error: error.message || "Internal server error" });
+  }
+});
+
+app.get("/api/me/relationships", async (req, res) => {
+  try {
+    const openClawId = await resolveRequestOpenClawId(req);
+    res.json(await readModelService.getRelationshipsView(openClawId));
   } catch (error) {
     res.status(500).json({ error: error.message || "Internal server error" });
   }
@@ -277,8 +370,8 @@ async function autoStartHosting() {
   const keyData = await createApiKey({ displayLabel: "auto" });
   connectorApiKey = keyData.apiKey;
 
-  // Spawn connector
-  const connectorPath = path.join(__dirname, "..", "connector", "index.js");
+  // Spawn ai-worker
+  const connectorPath = path.join(__dirname, "..", "ai-worker", "index.js");
   const wsUrl = `ws://127.0.0.1:${PORT}/ws/agent`;
   const args = [connectorPath, "--platform-url", wsUrl, "--api-key", connectorApiKey,
     "--openclaw-url", ocConfig.url, "--openclaw-token", ocConfig.token];
@@ -290,14 +383,14 @@ async function autoStartHosting() {
 
   connectorProcess.stdout.on("data", (data) => {
     const line = data.toString().trim();
-    if (line) console.log(`[connector] ${line}`);
+    if (line) console.log(`[ai-worker] ${line}`);
   });
   connectorProcess.stderr.on("data", (data) => {
     const line = data.toString().trim();
-    if (line) console.warn(`[connector] ${line}`);
+    if (line) console.warn(`[ai-worker] ${line}`);
   });
   connectorProcess.on("exit", (code) => {
-    console.log(`[connector] 进程退出, code=${code}`);
+    console.log(`[ai-worker] 进程退出, code=${code}`);
     connectorProcess = null;
   });
 
@@ -350,12 +443,45 @@ app.post("/api/agent/me/ticks", async (req, res) => {
 registerEntityRoutes("/api/lobsters/:lobsterId");
 registerEntityRoutes("/api/openclaws/:openClawId");
 
+app.get("/game-client", (req, res) => {
+  res.sendFile(path.join(__dirname, "..", "public", "game-client", "index.html"));
+});
+
 app.get("*", (req, res) => {
   res.sendFile(path.join(__dirname, "..", "public", "index.html"));
 });
 
 async function start() {
   await initializeStore();
+  readModelService = new ReadModelService({
+    store: {
+      getProfile,
+      getHomeView,
+      getSpectateView,
+      getSummaryView,
+      getEventsView,
+      getRelationshipsView,
+      getRelationshipDetail,
+    },
+    defaultOpenClawId: "lob_001",
+  });
+  worldService = new WorldService({ readModelService });
+  sessionService = new SessionService({ defaultOpenClawId: "lob_001" });
+  roomService = new RoomService({
+    tickIntervalMs: runtimeConfig.tickIntervalMs,
+  });
+  agentOrchestration = new AgentOrchestrationService();
+  wsManager = new WsManager();
+  clientRealtimeGateway = new ClientRealtimeGateway({
+    sessionService,
+    worldService,
+    roomService,
+    path: "/ws/client",
+    resolveOpenClawId: resolveRequestOpenClawId,
+    onEnterRoom: joinRoomAndWriteback,
+    onLeaveRoom: leaveRoomAndWriteback,
+  });
+
   const adapter = createOpenClawAdapter({
     mode: runtimeConfig.adapterMode,
     agentName: runtimeConfig.agentName,
@@ -371,7 +497,9 @@ async function start() {
       applyTickOutput,
       recordDiagnosticEvent,
     },
-    wsManager: wsManager,
+    wsManager,
+    agentOrchestration,
+    roomService,
     intervalMs: runtimeConfig.tickIntervalMs,
   });
 
@@ -393,10 +521,30 @@ async function start() {
     });
   });
 
-  // Attach WebSocket manager to HTTP server
-  wsManager = new WsManager();
-  wsManager.attach(server);
+  // Attach WebSocket managers to HTTP server
+  server.on("upgrade", (req, socket, head) => {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    if (url.pathname === "/ws/agent") {
+      if (!wsManager) {
+        socket.destroy();
+        return;
+      }
+      wsManager.handleUpgrade(req, socket, head);
+      return;
+    }
+    if (url.pathname === "/ws/client") {
+      if (!clientRealtimeGateway) {
+        socket.destroy();
+        return;
+      }
+      clientRealtimeGateway.handleUpgrade(req, socket, head);
+      return;
+    }
+    socket.destroy();
+  });
   scheduler.wsManager = wsManager;
+  scheduler.agentOrchestration = agentOrchestration;
+  agentOrchestration.setWsManager(wsManager);
 
   wsManager.on("agent_connected", ({ lobsterId }) => {
     console.log(`[ws] agent connected: ${lobsterId}`);
@@ -421,6 +569,11 @@ async function start() {
       killConnector();
       if (wsManager?.wss) {
         for (const client of wsManager.wss.clients) {
+          client.close(1001, "Server shutting down");
+        }
+      }
+      if (clientRealtimeGateway?.wss) {
+        for (const client of clientRealtimeGateway.wss.clients) {
           client.close(1001, "Server shutting down");
         }
       }
@@ -534,7 +687,110 @@ function registerEntityRoutes(basePath) {
 }
 
 function getOpenClawIdFromRequest(req) {
-  return req.params.openClawId || req.params.lobsterId;
+  const fromParams =
+    (req.params && (req.params.openClawId || req.params.lobsterId)) || "";
+  const fromExpressQuery = typeof req.query?.openClawId === "string" ? req.query.openClawId : "";
+  let fromRawUrl = "";
+  try {
+    const parsed = new URL(req.url, `http://${req.headers.host || "127.0.0.1"}`);
+    fromRawUrl = parsed.searchParams.get("openClawId") || "";
+  } catch {
+    fromRawUrl = "";
+  }
+  const fromHeader =
+    typeof req.headers["x-openclaw-id"] === "string" ? req.headers["x-openclaw-id"] : "";
+  return fromParams || fromExpressQuery || fromRawUrl || fromHeader || "";
+}
+
+async function resolveRequestOpenClawId(req) {
+  const explicitId = getOpenClawIdFromRequest(req);
+  if (explicitId) {
+    return explicitId;
+  }
+
+  const apiKeyHeader = req.headers["x-api-key"];
+  let apiKey = typeof apiKeyHeader === "string" ? apiKeyHeader.trim() : "";
+  if (!apiKey) {
+    try {
+      const parsed = new URL(req.url, `http://${req.headers.host || "127.0.0.1"}`);
+      apiKey = parsed.searchParams.get("apiKey") || "";
+    } catch {
+      apiKey = "";
+    }
+  }
+  if (apiKey) {
+    const fromKey = await resolveOpenClawIdFromApiKey(apiKey);
+    if (fromKey) {
+      return fromKey;
+    }
+  }
+
+  return "lob_001";
+}
+
+async function joinRoomAndWriteback({ roomId, openClawId }) {
+  const joined = roomService.joinRoom({ roomId, openClawId });
+  if (!joined.ok) return joined;
+
+  const happenedAt = new Date().toISOString();
+  const participants = joined.room.participants || [];
+  const relatedLobsterIds = participants.filter((id) => id !== openClawId);
+
+  await applyTickOutput(
+    {
+      actionType: "join_activity",
+      statePatch: {
+        currentActionType: "join_activity",
+        currentActionStartedAt: happenedAt,
+      },
+      emittedEvents: [
+        {
+          type: "join_activity",
+          payload: {
+            summary: `${openClawId} joined room ${roomId}.`,
+            relatedLobsterIds,
+            roomId,
+          },
+        },
+      ],
+    },
+    happenedAt,
+    openClawId
+  );
+
+  return joined;
+}
+
+async function leaveRoomAndWriteback({ roomId, openClawId }) {
+  const left = roomService.leaveRoom({ roomId, openClawId });
+  if (!left.ok) return left;
+
+  const happenedAt = new Date().toISOString();
+  const participants = left.room?.participants || [];
+
+  await applyTickOutput(
+    {
+      actionType: "finish_activity",
+      statePatch: {
+        currentActionType: "finish_activity",
+        currentActionStartedAt: happenedAt,
+      },
+      emittedEvents: [
+        {
+          type: "finish_activity",
+          payload: {
+            summary: `${openClawId} left room ${roomId}.`,
+            relatedLobsterIds: participants.filter((id) => id !== openClawId),
+            roomId,
+          },
+        },
+      ],
+    },
+    happenedAt,
+    openClawId
+  );
+
+  return left;
 }
 
 function getPublicBaseUrl(req) {

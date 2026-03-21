@@ -2,40 +2,46 @@ const { randomUUID } = require("crypto");
 const { WebSocketServer } = require("ws");
 const { getRuntimeConfig } = require("./config");
 const {
+  buildAgentTickRequest,
+} = require("./protocol/serverWorker");
+const {
   validateApiKey,
   bindApiKeyToOpenClaw,
   resolveOrCreateOpenClawId,
-  ensureOpenClawExists,
   markOpenClawWsConnected,
   markOpenClawWsDisconnected,
-  buildTickInput,
-  applyTickOutput,
-  recordDiagnosticEvent,
 } = require("./platformStore");
-const { inspectTickSafety } = require("./safetyGuardrails");
 
 const runtimeConfig = getRuntimeConfig();
 
 class WsManager {
   constructor() {
-    this.wss = null;
+    this.wss = new WebSocketServer({ noServer: true });
     this.connections = new Map(); // lobsterId -> { ws, keyRow, lobsterId }
     this.pendingTicks = new Map(); // tickId -> { resolve, reject, timer }
   }
 
   attach(httpServer) {
-    this.wss = new WebSocketServer({ noServer: true });
+    if (!this.wss) {
+      this.wss = new WebSocketServer({ noServer: true });
+    }
 
     httpServer.on("upgrade", (req, socket, head) => {
       const url = new URL(req.url, `http://${req.headers.host}`);
       if (url.pathname !== "/ws/agent") {
-        socket.destroy();
         return;
       }
 
-      this.wss.handleUpgrade(req, socket, head, (ws) => {
-        this.handleConnection(ws);
-      });
+      this.handleUpgrade(req, socket, head);
+    });
+  }
+
+  handleUpgrade(req, socket, head) {
+    if (!this.wss) {
+      this.wss = new WebSocketServer({ noServer: true });
+    }
+    this.wss.handleUpgrade(req, socket, head, (ws) => {
+      this.handleConnection(ws);
     });
   }
 
@@ -183,20 +189,7 @@ class WsManager {
     }
 
     const tickId = randomUUID();
-    const request = {
-      type: "tick_request",
-      tickId,
-      context: {
-        profile: tickInput.profile,
-        runtimeState: tickInput.runtimeState,
-        currentSpace: tickInput.currentSpace,
-        nearbyOpenClaws: tickInput.nearbyOpenClaws,
-        availableActivities: tickInput.availableActivities,
-        recentEvents: tickInput.recentEvents,
-        recentRelationships: tickInput.recentRelationships,
-      },
-      now: tickInput.now,
-    };
+    const request = buildAgentTickRequest(tickId, tickInput);
 
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {

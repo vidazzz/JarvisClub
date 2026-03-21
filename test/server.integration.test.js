@@ -5,6 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 const http = require("node:http");
 const { spawn, execFileSync } = require("node:child_process");
+const WebSocket = globalThis.WebSocket || require("ws").WebSocket;
 
 const TEST_HOST = "127.0.0.1";
 const TEST_PORT = 3101;
@@ -545,6 +546,236 @@ test("spectate only shows real nearby OpenClaws and exposes the receptionist NPC
   }
 });
 
+test("new /api/me read models expose world and room snapshots", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-social-platform-read-models-"));
+  const dbPath = path.join(tempDir, "test.db");
+  const port = TEST_PORT + 11;
+  const server = await startServer({
+    PORT: String(port),
+    HOST: TEST_HOST,
+    OPENCLAW_TICK_INTERVAL_MS: "5000",
+    OPENCLAW_DB_PATH: dbPath,
+    OPENCLAW_ADAPTER_MODE: "mock",
+  });
+
+  try {
+    const world = await fetchJson(`http://${TEST_HOST}:${port}/api/me/world`);
+    assert.equal(world.openClawId, "lob_001");
+    assert.ok(Array.isArray(world.recentEvents));
+
+    const joinResponse = await postJson(
+      `http://${TEST_HOST}:${port}/api/me/rooms/room_arcade_001/join`,
+      {}
+    );
+    assert.equal(joinResponse.statusCode, 201);
+    const room = JSON.parse(joinResponse.body);
+    assert.equal(room.roomId, "room_arcade_001");
+    assert.equal(room.status, "active");
+    assert.ok(Array.isArray(room.participants));
+    assert.ok(room.participants.includes("lob_001"));
+
+    const roomSnapshot = await fetchJson(`http://${TEST_HOST}:${port}/api/me/rooms/room_arcade_001`);
+    assert.equal(roomSnapshot.roomId, "room_arcade_001");
+
+    const leaveResponse = await postJson(
+      `http://${TEST_HOST}:${port}/api/me/rooms/room_arcade_001/leave`,
+      {}
+    );
+    assert.equal(leaveResponse.statusCode, 200);
+    const left = JSON.parse(leaveResponse.body);
+    assert.equal(left.status, "ended");
+  } finally {
+    await stopServer(server);
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("client websocket supports session resume and world snapshot", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-social-platform-client-ws-"));
+  const dbPath = path.join(tempDir, "test.db");
+  const port = TEST_PORT + 12;
+  const server = await startServer({
+    PORT: String(port),
+    HOST: TEST_HOST,
+    OPENCLAW_TICK_INTERVAL_MS: "5000",
+    OPENCLAW_DB_PATH: dbPath,
+    OPENCLAW_ADAPTER_MODE: "mock",
+  });
+
+  try {
+    const wsUrl = `ws://${TEST_HOST}:${port}/ws/client`;
+    const first = new WebSocket(wsUrl);
+    const firstReady = await waitWsMessage(first, "session_ready");
+    assert.ok(firstReady.sessionId);
+    assert.ok(firstReady.resumeToken);
+
+    first.send(JSON.stringify({ type: "enter_world" }));
+    const world = await waitWsMessage(first, "world_snapshot");
+    assert.equal(world.world.openClawId, "lob_001");
+    first.close();
+
+    const second = new WebSocket(wsUrl);
+    await waitWsMessage(second, "session_ready");
+    second.send(JSON.stringify({ type: "resume_session", resumeToken: firstReady.resumeToken }));
+    const resumed = await waitWsMessage(second, "session_ready");
+    assert.equal(resumed.sessionId, firstReady.sessionId);
+    second.close();
+  } finally {
+    await stopServer(server);
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("api key remains compatible with /api/me world and /ws/client session bootstrap", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-social-platform-api-key-compat-"));
+  const dbPath = path.join(tempDir, "test.db");
+  const port = TEST_PORT + 13;
+  const server = await startServer({
+    PORT: String(port),
+    HOST: TEST_HOST,
+    OPENCLAW_TICK_INTERVAL_MS: "5000",
+    OPENCLAW_DB_PATH: dbPath,
+    OPENCLAW_ADAPTER_MODE: "mock",
+  });
+
+  try {
+    const key = await createApiKeyForTests(port);
+    const world = await fetchJson(`http://${TEST_HOST}:${port}/api/me/world`, {
+      headers: { "x-api-key": key },
+    });
+    assert.equal(world.openClawId, "lob_001");
+
+    const ws = new WebSocket(`ws://${TEST_HOST}:${port}/ws/client?apiKey=${encodeURIComponent(key)}`);
+    await waitWsOpen(ws);
+    const ready = await waitWsMessage(ws, "session_ready");
+    assert.equal(ready.openClawId, "lob_001");
+    ws.close();
+  } finally {
+    await stopServer(server);
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("room join and leave write back to event stream continuity", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-social-platform-room-writeback-"));
+  const dbPath = path.join(tempDir, "test.db");
+  const port = TEST_PORT + 14;
+  const server = await startServer({
+    PORT: String(port),
+    HOST: TEST_HOST,
+    OPENCLAW_TICK_INTERVAL_MS: "5000",
+    OPENCLAW_DB_PATH: dbPath,
+    OPENCLAW_ADAPTER_MODE: "mock",
+  });
+
+  try {
+    await postJson(`http://${TEST_HOST}:${port}/api/me/rooms/room_arcade_007/join`, {});
+    await postJson(`http://${TEST_HOST}:${port}/api/me/rooms/room_arcade_007/leave`, {});
+
+    const events = await fetchJson(`http://${TEST_HOST}:${port}/api/me/events?limit=20`);
+    const joined = events.events.find(
+      (event) =>
+        event.type === "join_activity" &&
+        event.payload.summary.includes("room_arcade_007")
+    );
+    const left = events.events.find(
+      (event) =>
+        event.type === "finish_activity" &&
+        event.payload.summary.includes("room_arcade_007")
+    );
+    assert.ok(joined);
+    assert.ok(left);
+  } finally {
+    await stopServer(server);
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("worker timeout degrades safely and records diagnostic event", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-social-platform-worker-timeout-"));
+  const dbPath = path.join(tempDir, "test.db");
+  const port = TEST_PORT + 15;
+  const server = await startServer({
+    PORT: String(port),
+    HOST: TEST_HOST,
+    OPENCLAW_TICK_INTERVAL_MS: "90",
+    OPENCLAW_WS_TICK_TIMEOUT_MS: "80",
+    OPENCLAW_DB_PATH: dbPath,
+    OPENCLAW_ADAPTER_MODE: "mock",
+  });
+
+  let ws = null;
+  try {
+    const key = await createApiKeyForTests(port);
+    ws = new WebSocket(`ws://${TEST_HOST}:${port}/ws/agent`);
+    await waitWsOpen(ws);
+    ws.send(JSON.stringify({ type: "auth", apiKey: key }));
+    await waitWsMessage(ws, "auth_ok");
+
+    await wait(400);
+    const events = await fetchJson(`http://${TEST_HOST}:${port}/api/openclaws/lob_001/events?limit=30`);
+    assert.ok(events.events.some((event) => event.type === "worker_fallback"));
+  } finally {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.close();
+    }
+    await stopServer(server);
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("invalid worker proposal is normalized and diagnosed", async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-social-platform-worker-invalid-"));
+  const dbPath = path.join(tempDir, "test.db");
+  const port = TEST_PORT + 16;
+  const server = await startServer({
+    PORT: String(port),
+    HOST: TEST_HOST,
+    OPENCLAW_TICK_INTERVAL_MS: "100",
+    OPENCLAW_WS_TICK_TIMEOUT_MS: "200",
+    OPENCLAW_DB_PATH: dbPath,
+    OPENCLAW_ADAPTER_MODE: "mock",
+  });
+
+  let ws = null;
+  try {
+    const key = await createApiKeyForTests(port);
+    ws = new WebSocket(`ws://${TEST_HOST}:${port}/ws/agent`);
+    await waitWsOpen(ws);
+    ws.send(JSON.stringify({ type: "auth", apiKey: key }));
+    await waitWsMessage(ws, "auth_ok");
+
+    ws.addEventListener("message", (event) => {
+      const msg = JSON.parse(event.data);
+      if (msg.type === "agent_tick_request" || msg.type === "tick_request") {
+        ws.send(
+          JSON.stringify({
+            type: "tick_response",
+            tickId: msg.tickId,
+            actionProposal: {
+              actionType: "hack_database",
+              summary: "attempted forbidden proposal",
+              relatedLobsterIds: [],
+              statePatch: {},
+            },
+          })
+        );
+      }
+    });
+
+    await wait(450);
+    const events = await fetchJson(`http://${TEST_HOST}:${port}/api/openclaws/lob_001/events?limit=40`);
+    assert.ok(events.events.some((event) => event.type === "worker_invalid_proposal"));
+    assert.ok(events.events.some((event) => event.type === "idle"));
+  } finally {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.close();
+    }
+    await stopServer(server);
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 function startServer(extraEnv) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, ["src/server.js"], {
@@ -677,4 +908,78 @@ function readSseTypes(url, expectedTypes) {
       reject(error);
     });
   });
+}
+
+function waitWsOpen(ws) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error("Timed out waiting for websocket open"));
+    }, 4000);
+
+    function onOpen() {
+      cleanup();
+      resolve();
+    }
+
+    function onError(error) {
+      cleanup();
+      reject(error);
+    }
+
+    function cleanup() {
+      clearTimeout(timeout);
+      ws.removeEventListener("open", onOpen);
+      ws.removeEventListener("error", onError);
+    }
+
+    ws.addEventListener("open", onOpen);
+    ws.addEventListener("error", onError);
+  });
+}
+
+function waitWsMessage(ws, expectedType) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error(`Timed out waiting for ws message type: ${expectedType}`));
+    }, 4000);
+
+    function onMessage(event) {
+      let payload;
+      try {
+        payload = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+      if (payload.type === expectedType) {
+        cleanup();
+        resolve(payload);
+      }
+    }
+
+    function onError(error) {
+      cleanup();
+      reject(error);
+    }
+
+    function cleanup() {
+      clearTimeout(timeout);
+      ws.removeEventListener("message", onMessage);
+      ws.removeEventListener("error", onError);
+    }
+
+    ws.addEventListener("message", onMessage);
+    ws.addEventListener("error", onError);
+  });
+}
+
+async function createApiKeyForTests(port) {
+  const response = await postJson(`http://${TEST_HOST}:${port}/api/me/api-keys`, {
+    displayLabel: "test-suite",
+  });
+  assert.equal(response.statusCode, 201);
+  const payload = JSON.parse(response.body);
+  assert.ok(payload.apiKey);
+  return payload.apiKey;
 }

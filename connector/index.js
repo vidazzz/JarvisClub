@@ -50,7 +50,7 @@ function parseArgs() {
 }
 
 function printUsage() {
-  console.log(`OpenClaw 连接器 - 桥接 JarvisClub 平台与 OpenClaw 网关
+  console.log(`OpenClaw AI Worker - 桥接 JarvisClub 平台与 OpenClaw 网关
 
 用法:
   node connector/index.js [选项]
@@ -151,7 +151,8 @@ function handleMessage(msg, opts) {
       break;
 
     case "tick_request":
-      log(`收到 tick_request [${msg.tickId}]`);
+    case "agent_tick_request":
+      log(`收到 ${msg.type} [${msg.tickId}]`);
       handleTickRequest(msg, opts).catch((err) => {
         log(`处理 tick 失败: ${err.message}`);
         sendTickResponse(msg.tickId, buildFallbackResponse("处理失败: " + err.message));
@@ -210,6 +211,15 @@ function sendTickResponse(tickId, response) {
   ws.send(JSON.stringify({
     type: "tick_response",
     tickId,
+    actionProposal: {
+      actionType: response.actionType,
+      summary:
+        response.emittedEvents?.[0]?.payload?.summary ||
+        "AI worker completed one action proposal.",
+      relatedLobsterIds: response.emittedEvents?.[0]?.payload?.relatedLobsterIds || [],
+      statePatch: response.statePatch || {},
+    },
+    // Keep legacy shape for backward compatibility.
     ...response,
   }));
 }
@@ -451,7 +461,7 @@ function log(...args) {
 
 const opts = parseArgs();
 
-log("OpenClaw 连接器启动");
+log("OpenClaw AI Worker 启动");
 log(`  平台: ${opts.platformUrl}`);
 log(`  模式: ${opts.mock ? "mock" : "openclaw"}`);
 if (!opts.mock) {
@@ -464,13 +474,13 @@ connect(opts);
 process.on("SIGINT", () => {
   log("收到 SIGINT，正在关闭...");
   shuttingDown = true;
-  if (ws) ws.close(1000, "Connector shutting down");
+  if (ws) ws.close(1000, "Worker shutting down");
   setTimeout(() => process.exit(0), 1000);
 });
 
 process.on("SIGTERM", () => {
   log("收到 SIGTERM，正在关闭...");
   shuttingDown = true;
-  if (ws) ws.close(1000, "Connector shutting down");
+  if (ws) ws.close(1000, "Worker shutting down");
   setTimeout(() => process.exit(0), 1000);
 });
